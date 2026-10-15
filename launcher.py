@@ -14,7 +14,7 @@ import time
 from urllib.error import URLError
 from urllib.request import ProxyHandler, build_opener
 
-VERSION = "0.3.0"
+VERSION = "0.3.1"
 SERVICE = "disk-space-analyzer"
 ROOT = Path(__file__).resolve().parent
 DEFAULT_STATE = Path.home() / "Library" / "Application Support" / "磁盘空间管理"

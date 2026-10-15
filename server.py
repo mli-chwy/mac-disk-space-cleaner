@@ -429,7 +429,7 @@ def scan_worker(root: Path, scan_id: str) -> None:
             # Publishing complete under the same lock as readers makes this
             # immutable subtree available while other directories keep scanning.
             aggregate["complete"] = finished and not aggregate["error_count"]
-            if finished:
+            if aggregate["complete"]:
                 STATE.dirs_completed += 1
             STATE.current_directory = str(frames[-1][0]) if frames else None
             if frames:
@@ -1284,7 +1284,7 @@ class Handler(BaseHTTPRequestHandler):
         quick_mode = query.get("mode", [""])[0] == "quick"
         def selected_scope(selected: Path) -> Path:
             return normalize_existing(query.get("scope", query.get("root", [str(selected)]))[0])
-        if path == "/api/health": self.send_json({"ok": True, "service": "disk-space-analyzer", "version": "0.3.0", "platform": os.uname().sysname, "home": str(HOME), "token": TOKEN, "index": {"available": sys_is_macos() and Path("/usr/bin/mdfind").exists(), "provider": "Spotlight" if sys_is_macos() else "filesystem"}, "trash": {"available": compile_native_trash() is not None, "fallback": "Reveal in Finder, then move to Trash manually"}, "defaults": {"scan_path": str(DEFAULT_SCAN_ROOT), "data_path": "/System/Volumes/Data" if Path("/System/Volumes/Data").is_dir() else None, "port": self.server.server_address[1]}})
+        if path == "/api/health": self.send_json({"ok": True, "service": "disk-space-analyzer", "version": "0.3.1", "platform": os.uname().sysname, "home": str(HOME), "token": TOKEN, "index": {"available": sys_is_macos() and Path("/usr/bin/mdfind").exists(), "provider": "Spotlight" if sys_is_macos() else "filesystem"}, "trash": {"available": compile_native_trash() is not None, "fallback": "Reveal in Finder, then move to Trash manually"}, "defaults": {"scan_path": str(DEFAULT_SCAN_ROOT), "data_path": "/System/Volumes/Data" if Path("/System/Volumes/Data").is_dir() else None, "port": self.server.server_address[1]}})
         elif path == "/api/volumes": self.send_json({"volumes": mounted_volumes()})
         elif path in ("/api/scan/status", "/api/status"): self.send_json(STATE.snapshot())
         elif path == "/api/summary": self.send_json(STATE.snapshot() | {"volumes": mounted_volumes()})

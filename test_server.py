@@ -92,6 +92,8 @@ class BackendTests(unittest.TestCase):
         with mock.patch.object(server.os, "scandir", side_effect=fake_scandir):
             self.scan()
         self.assertEqual(server.STATE.snapshot()["error_count"], 1)
+        self.assertEqual(server.STATE.snapshot()["dirs_completed"], 1)
+        self.assertLessEqual(server.STATE.dirs_completed, server.STATE.dirs_scanned)
         tree = server.tree_for(self.root, 100)
         self.assertFalse(tree["complete"])
         self.assertTrue(tree["partial"])
