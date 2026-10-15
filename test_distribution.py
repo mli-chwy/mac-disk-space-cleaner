@@ -1,7 +1,6 @@
 """Regression coverage for local startup and the public source distribution."""
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 import hashlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -9,7 +8,10 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import shutil
+import signal
 import socket
+import sys
 import tempfile
 import threading
 import unittest
@@ -57,7 +59,7 @@ class LauncherTests(unittest.TestCase):
                 self.assertEqual(launcher.health(port), payload)
 
     def test_current_service_is_reused_even_with_proxy_environment(self):
-        payload = {"ok": True, "service": "disk-space-analyzer", "version": "0.2.0"}
+        payload = {"ok": True, "service": "disk-space-analyzer", "version": launcher.VERSION}
         with http_service(payload) as port, tempfile.TemporaryDirectory() as tmp:
             with patch.dict(os.environ, {"http_proxy": "http://127.0.0.1:1", "no_proxy": ""}), \
                     patch.object(launcher.subprocess, "Popen") as spawn:
@@ -65,9 +67,12 @@ class LauncherTests(unittest.TestCase):
                 spawn.assert_not_called()
 
     def test_simultaneous_launches_start_only_one_detached_service(self):
-        # A tiny process fixture exercises locking, readiness, and a copied app
-        # runtime without reading or scanning any user files.
-        fixture = '''import json, os, time
+        # Double-clicks create separate launcher processes. Avoid making this a
+        # test of fork-from-worker-thread behavior on macOS or mocking Popen.
+        # Stage logs and timed stack dumps make a slow bind/DNS lookup visible.
+        fixture = '''import faulthandler, json, os, time
+faulthandler.dump_traceback_later(4, repeat=True)
+print('fixture: boot', flush=True)
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 import argparse
@@ -75,48 +80,67 @@ p=argparse.ArgumentParser(); p.add_argument('--host'); p.add_argument('--port', 
 state=Path(os.environ['ATLAS_STATE_DIR'])
 with (state/'test-starts').open('a') as f: f.write(str(os.getpid())+'\\n')
 time.sleep(0.3)
+print('fixture: before HTTPServer bind', flush=True)
 class Handler(BaseHTTPRequestHandler):
  def log_message(self, *a): pass
  def do_GET(self):
   self.send_response(200); self.end_headers()
-  self.wfile.write(json.dumps({'ok':True,'service':'disk-space-analyzer','version':'0.2.0'}).encode())
-HTTPServer((a.host,a.port), Handler).serve_forever()
-'''
+  self.wfile.write(json.dumps({'ok':True,'service':'disk-space-analyzer','version':__SERVICE_VERSION__}).encode())
+server=HTTPServer((a.host,a.port), Handler)
+print('fixture: bound; entering serve_forever', flush=True)
+server.serve_forever()
+'''.replace("__SERVICE_VERSION__", json.dumps(launcher.VERSION))
         with tempfile.TemporaryDirectory() as tmp:
-            base = Path(tmp)
+            base = Path(tmp).resolve()
             runtime, state = base / "app resources", base / "state"
             runtime.mkdir()
+            shutil.copyfile(Path(launcher.__file__), runtime / "launcher.py")
             (runtime / "server.py").write_text(fixture, encoding="utf-8")
             with socket.socket() as sock:
                 sock.bind(("127.0.0.1", 0))
                 port = sock.getsockname()[1]
             processes = []
-            real_popen = launcher.subprocess.Popen
-
-            def remember_process(*args, **kwargs):
-                process = real_popen(*args, **kwargs)
-                processes.append(process)
-                return process
-
+            output_paths = [base / f"launcher-{n}.log" for n in range(2)]
+            driver = (
+                "import faulthandler; faulthandler.dump_traceback_later(4, repeat=True); "
+                "import launcher, pathlib, sys; "
+                "print('launcher: entering ensure_server', flush=True); "
+                "launcher.ensure_server(int(sys.argv[1]), pathlib.Path(sys.argv[2]), 8.0); "
+                "print('launcher: ready', flush=True)"
+            )
             try:
-                with patch.object(launcher, "ROOT", runtime), \
-                        patch.object(launcher.subprocess, "Popen", side_effect=remember_process), \
-                        ThreadPoolExecutor(max_workers=2) as pool:
-                    futures = [pool.submit(launcher.ensure_server, port, state, 8.0) for _ in range(2)]
-                    for future in futures:
-                        future.result(timeout=12)
+                for output_path in output_paths:
+                    with output_path.open("wb") as output:
+                        processes.append(launcher.subprocess.Popen(
+                            [sys.executable, "-c", driver, str(port), str(state)], cwd=runtime,
+                            stdout=output, stderr=output, stdin=launcher.subprocess.DEVNULL,
+                        ))
+                for process in processes:
+                    self.assertEqual(process.wait(timeout=12), 0)
                 starts = (state / "test-starts").read_text().splitlines()
                 self.assertEqual(len(starts), 1)
                 info = json.loads((state / f"server-{port}.json").read_text())
                 self.assertEqual(info["pid"], int(starts[0]))
                 self.assertEqual(info["source"], str(runtime))
                 self.assertTrue(launcher.matching(launcher.health(port)))
+            except Exception as exc:
+                sections = []
+                for path in output_paths + [state / "logs/server.log"]:
+                    content = path.read_text(errors="replace")[-12000:] if path.exists() else "(not created)"
+                    sections.append(f"{path.name}:\n{content}")
+                raise AssertionError(f"Concurrent launcher regression: {exc}\n" + "\n".join(sections)) from exc
             finally:
-                # Only process objects created by this isolated test are ended.
+                # Only launchers and fixture PIDs created by this test are ended.
                 for process in processes:
                     if process.poll() is None:
                         process.terminate()
                     process.wait(timeout=5)
+                marker = state / "test-starts"
+                for pid in marker.read_text().splitlines() if marker.exists() else []:
+                    try:
+                        os.kill(int(pid), signal.SIGTERM)
+                    except ProcessLookupError:
+                        pass
 
 
 class SourceDistributionTests(unittest.TestCase):

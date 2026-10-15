@@ -8,7 +8,7 @@
 
 适用目标：**macOS 12 或更新版本，Intel / Apple Silicon，Python 3.10+**。已在 macOS 26.5.2 / Apple Silicon / Python 3.12 上验证安装、页面扫描和 Finder 定位；Intel 辅助程序在 Rosetta 下通过测试，其他系统版本仍需实机反馈。当前提供源码安装包，**尚未内置 Python，也未经 Apple 公证**，不能承诺所有 Mac 都可直接双击运行。没有 Python 时，请先从 [Python 官网](https://www.python.org/downloads/macos/) 安装适用于你的系统的版本。
 
-1. 在 [Releases](https://github.com/mli-chwy/mac-disk-space-cleaner/releases) 下载 `disk-space-analyzer-v0.2.0-macos-source.zip`，解压。
+1. 在 [Releases](https://github.com/mli-chwy/mac-disk-space-cleaner/releases) 下载 `disk-space-analyzer-v0.2.1-macos-source.zip`，解压。
 2. 双击 **安装到应用程序.command**。安装器会创建 `磁盘空间管理.app` 和同名桌面入口；没有 `/Applications` 写入权限时使用 `~/Applications`。
 3. 双击桌面的 **磁盘空间管理**，等待本机服务就绪，浏览器会打开“目录空间视图”。重复启动会复用同一版本的服务。
 

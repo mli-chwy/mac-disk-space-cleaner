@@ -34,7 +34,7 @@ def release_files(root: Path) -> list[Path]:
 
 def build(root: Path, output: Path, version: str) -> tuple[Path, Path]:
     if not re.fullmatch(r"\d+\.\d+\.\d+(?:-[A-Za-z0-9.]+)?", version):
-        raise ValueError("Version must be a semantic version, for example 0.2.0")
+        raise ValueError("Version must be a semantic version, for example 0.2.1")
     files = release_files(root)
     output.mkdir(parents=True, exist_ok=True)
     stem = f"disk-space-analyzer-v{version}-macos-source"
@@ -60,7 +60,7 @@ def build(root: Path, output: Path, version: str) -> tuple[Path, Path]:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--version", default="0.2.0")
+    parser.add_argument("--version", default="0.2.1")
     parser.add_argument("--output", type=Path, default=ROOT / "dist")
     args = parser.parse_args()
     for path in build(ROOT, args.output.expanduser().resolve(), args.version):
