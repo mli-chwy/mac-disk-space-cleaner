@@ -30,8 +30,10 @@ jobs:
           result = subprocess.run([sys.executable, '-m', 'unittest', 'discover', '-s', '.', '-p', 'test_*.py', '-v'], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
           print(result.stdout)
           if result.returncode:
-              detail = result.stdout[-16000:].replace('%', '%25').replace('\r', '%0D').replace('\n', '%0A')
-              print('::error title=Regression test failure::' + detail)
+              tail = result.stdout[-24000:]
+              for index in range(0, len(tail), 2500):
+                  detail = tail[index:index + 2500].replace('%', '%25').replace('\r', '%0D').replace('\n', '%0A')
+                  print(f'::error title=Regression failure part {index // 2500 + 1}::' + detail)
           raise SystemExit(result.returncode)
           PYTEST
       - name: JavaScript and shell checks
