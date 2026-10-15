@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 import hashlib
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler
 import importlib.util
 import json
 import os
@@ -19,6 +19,7 @@ from unittest.mock import patch
 import zipfile
 
 import launcher
+from server import LoopbackHTTPServer
 
 _spec = importlib.util.spec_from_file_location("build_release", Path(__file__).parent / "scripts/build_release.py")
 packaging = importlib.util.module_from_spec(_spec)
@@ -36,7 +37,7 @@ def http_service(payload):
             self.end_headers()
             self.wfile.write(json.dumps(payload).encode())
 
-    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    server = LoopbackHTTPServer(("127.0.0.1", 0), Handler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:
@@ -73,20 +74,21 @@ class LauncherTests(unittest.TestCase):
         fixture = '''import faulthandler, json, os, time
 faulthandler.dump_traceback_later(4, repeat=True)
 print('fixture: boot', flush=True)
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler
+from backend import LoopbackHTTPServer
 from pathlib import Path
 import argparse
 p=argparse.ArgumentParser(); p.add_argument('--host'); p.add_argument('--port', type=int); a=p.parse_args()
 state=Path(os.environ['ATLAS_STATE_DIR'])
 with (state/'test-starts').open('a') as f: f.write(str(os.getpid())+'\\n')
 time.sleep(0.3)
-print('fixture: before HTTPServer bind', flush=True)
+print('fixture: before production LoopbackHTTPServer bind', flush=True)
 class Handler(BaseHTTPRequestHandler):
  def log_message(self, *a): pass
  def do_GET(self):
   self.send_response(200); self.end_headers()
   self.wfile.write(json.dumps({'ok':True,'service':'disk-space-analyzer','version':__SERVICE_VERSION__}).encode())
-server=HTTPServer((a.host,a.port), Handler)
+server=LoopbackHTTPServer((a.host,a.port), Handler)
 print('fixture: bound; entering serve_forever', flush=True)
 server.serve_forever()
 '''.replace("__SERVICE_VERSION__", json.dumps(launcher.VERSION))
@@ -95,6 +97,7 @@ server.serve_forever()
             runtime, state = base / "app resources", base / "state"
             runtime.mkdir()
             shutil.copyfile(Path(launcher.__file__), runtime / "launcher.py")
+            shutil.copyfile(Path(__file__).with_name("server.py"), runtime / "backend.py")
             (runtime / "server.py").write_text(fixture, encoding="utf-8")
             with socket.socket() as sock:
                 sock.bind(("127.0.0.1", 0))
@@ -125,10 +128,18 @@ server.serve_forever()
                 self.assertTrue(launcher.matching(launcher.health(port)))
             except Exception as exc:
                 sections = []
-                for path in output_paths + [state / "logs/server.log"]:
-                    content = path.read_text(errors="replace")[-12000:] if path.exists() else "(not created)"
-                    sections.append(f"{path.name}:\n{content}")
-                raise AssertionError(f"Concurrent launcher regression: {exc}\n" + "\n".join(sections)) from exc
+                # GitHub annotations truncate large payloads. Keep the server
+                # first and retain every process's tail within one short error.
+                for path in [state / "logs/server.log"] + output_paths:
+                    content = path.read_text(errors="replace") if path.exists() else "(not created)"
+                    if path.name == "server.log":
+                        stages = "\n".join(line for line in content.splitlines() if line.startswith("fixture:"))[:150]
+                        content = stages + "\n[tail]\n" + content[-750:]
+                    else:
+                        content = content[-900:]
+                    sections.append(f"{path.name}:\n{content}"[:1000])
+                message = f"Concurrent launcher regression: {str(exc)[:120]}\n" + "\n".join(sections)
+                raise AssertionError(message[:3000]) from None
             finally:
                 # Only launchers and fixture PIDs created by this test are ended.
                 for process in processes:

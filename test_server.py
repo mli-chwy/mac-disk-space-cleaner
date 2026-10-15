@@ -4,6 +4,7 @@ import http.client
 import importlib.util
 import json
 import os
+import socket
 from pathlib import Path
 import subprocess
 import sys
@@ -154,7 +155,7 @@ class BackendTests(unittest.TestCase):
         self.assertEqual(server.STATE.files_scanned, 0)
 
     def test_rebinding_origin_and_token_guards(self):
-        httpd = server.ThreadingHTTPServer(("127.0.0.1", 0), server.Handler)
+        httpd = server.LoopbackHTTPServer(("127.0.0.1", 0), server.Handler)
         port = httpd.server_address[1]
         thread = threading.Thread(target=httpd.serve_forever, daemon=True); thread.start()
         def request(path, headers=None, method="GET", data=None):
@@ -174,6 +175,27 @@ class BackendTests(unittest.TestCase):
             self.assertEqual(request("/api/scan/cancel", headers, "POST", "{}")[0], 200)
         finally:
             httpd.shutdown(); httpd.server_close(); thread.join(2)
+
+    def test_loopback_server_binds_without_reverse_dns(self):
+        original_family = server.ThreadingHTTPServer.address_family
+        with mock.patch.object(socket, "getfqdn", side_effect=AssertionError("reverse DNS must not run")) as lookup:
+            with server.LoopbackHTTPServer(("127.0.0.1", 0), server.Handler) as httpd:
+                self.assertEqual(httpd.server_name, "localhost")
+                self.assertEqual(httpd.server_port, httpd.server_address[1])
+                self.assertGreater(httpd.server_port, 0)
+            if socket.has_ipv6:
+                try:
+                    ipv6 = server.LoopbackHTTPServerV6(("::1", 0), server.Handler)
+                except OSError as exc:
+                    if exc.errno not in (errno.EAFNOSUPPORT, errno.EADDRNOTAVAIL):
+                        raise
+                else:
+                    with ipv6:
+                        self.assertEqual(ipv6.server_name, "localhost")
+                        self.assertEqual(ipv6.server_port, ipv6.server_address[1])
+                        self.assertEqual(ipv6.address_family, socket.AF_INET6)
+            lookup.assert_not_called()
+        self.assertEqual(server.ThreadingHTTPServer.address_family, original_family)
 
     def test_trash_preview_protects_symlinks_unchanged_file_and_never_autocompiles(self):
         home = self.base / "home"; docs = home / "Documents"; docs.mkdir(parents=True)

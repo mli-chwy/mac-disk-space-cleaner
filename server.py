@@ -19,6 +19,7 @@ import re
 import secrets
 import shutil
 import signal
+import socket
 import subprocess
 import tempfile
 import threading
@@ -28,6 +29,7 @@ from collections import defaultdict
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from socketserver import TCPServer
 from urllib.parse import parse_qs, unquote, urlparse
 
 ROOT = Path(__file__).resolve().parent
@@ -858,6 +860,19 @@ def confirm_trash(token: str) -> dict:
     return native_trash(review["items"])
 
 
+class LoopbackHTTPServer(ThreadingHTTPServer):
+    """Bind locally without HTTPServer's blocking reverse-DNS lookup."""
+
+    def server_bind(self) -> None:
+        TCPServer.server_bind(self)
+        self.server_name = "localhost"
+        self.server_port = self.server_address[1]
+
+
+class LoopbackHTTPServerV6(LoopbackHTTPServer):
+    address_family = socket.AF_INET6
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "DiskSpaceAnalyzer/2.0"
 
@@ -984,10 +999,10 @@ def main() -> None:
     parser.add_argument("--host", default=os.environ.get("DISK_ANALYZER_HOST", "127.0.0.1")); parser.add_argument("--port", type=int, default=int(os.environ.get("DISK_ANALYZER_PORT", "8799"))); args = parser.parse_args()
     if args.host not in {"127.0.0.1", "localhost", "::1"}:
         parser.error("--host must be a loopback address")
-    if args.host == "::1":
-        import socket
-        ThreadingHTTPServer.address_family = socket.AF_INET6
-    load_snapshot(); server = ThreadingHTTPServer((args.host, args.port), Handler)
+    server_class = LoopbackHTTPServerV6 if args.host == "::1" else LoopbackHTTPServer
+    # Keep even the optional localhost spelling independent of DNS resolution.
+    bind_host = "127.0.0.1" if args.host == "localhost" else args.host
+    load_snapshot(); server = server_class((bind_host, args.port), Handler)
     print(f"Disk Space Analyzer listening on http://{args.host}:{args.port}", flush=True)
     try: server.serve_forever()
     except KeyboardInterrupt: pass
