@@ -13,6 +13,7 @@ import threading
 import time
 import unittest
 from unittest import mock
+from urllib.parse import urlencode
 
 spec = importlib.util.spec_from_file_location("atlas_server", Path(__file__).with_name("server.py"))
 server = importlib.util.module_from_spec(spec)
@@ -26,6 +27,8 @@ class BackendTests(unittest.TestCase):
         self.root = self.base / "fixture"
         self.root.mkdir()
         self.patches = [mock.patch.object(server, "STATE", server.ScanState()),
+                        mock.patch.object(server, "QUICK_CACHE", {}),
+                        mock.patch.object(server, "QUICK_INFLIGHT", {}),
                         mock.patch.object(server, "STATE_DIR", self.base / "state"),
                         mock.patch.object(server, "SNAPSHOT_PATH", self.base / "state" / "scan.json")]
         for patch in self.patches:
@@ -223,6 +226,201 @@ class BackendTests(unittest.TestCase):
         result = subprocess.run([sys.executable, str(Path(server.__file__)), "--host", "0.0.0.0"], capture_output=True, timeout=3)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn(b"loopback", result.stderr)
+
+    def test_quick_snapshot_shared_scoped_sparse_hardlinks_and_expired_consumers(self):
+        child = self.root / "child"; child.mkdir()
+        one = child / "one.txt"; one.write_bytes(b"a" * 9000)
+        hard = child / "two.txt"; os.link(one, hard)
+        sparse = child / "sparse.bin"
+        with sparse.open("wb") as stream: stream.truncate(4 * 1024 * 1024)
+        other = self.root / "other.log"; other.write_bytes(b"b" * 5000)
+        outside = self.base / "outside.txt"; outside.write_bytes(b"outside")
+        alias = self.root / "alias"; alias.symlink_to(child, target_is_directory=True)
+        link = self.root / "link.txt"; link.symlink_to(one)
+        hidden = self.root / "not-indexed.txt"; hidden.write_bytes(b"not indexed")
+        candidates = [other, one, hard, sparse, outside, alias / "one.txt", link, child]
+        query_metadata = {"available": True, "query_complete": True, "error": None}
+        old_state = server.STATE.snapshot()
+        with mock.patch.object(server, "QUICK_THRESHOLD", 1), mock.patch.object(server, "quick_spotlight_candidates", return_value=(candidates, query_metadata)) as query, mock.patch.object(server.os, "scandir", side_effect=AssertionError("quick mode must not walk")):
+            snapshot, hit = server.quick_snapshot(self.root)
+            self.assertFalse(hit)
+            snapshot["created_at"] -= server.SPOTLIGHT_TTL + 1
+            tree = server.quick_tree_for(child, self.root, 100)
+            extensions = server.quick_extension_stats(child, self.root)
+            treemap = server.quick_treemap_for(child, self.root)
+            largest = server.quick_largest(child, self.root, 100)
+            self.assertEqual(query.call_count, 1)
+            self.assertEqual({x["snapshot_id"] for x in [tree, extensions, treemap, largest]}, {snapshot["metadata"]["snapshot_id"]})
+            allocated = one.stat().st_blocks * 512 + sparse.stat().st_blocks * 512
+            self.assertEqual(tree["size"], allocated)
+            self.assertEqual(tree["files"], 3)
+            self.assertEqual(sum(x["size"] for x in tree["children"]), allocated)
+            self.assertEqual(extensions["size"], allocated)
+            self.assertEqual(extensions["count"], 3)
+            self.assertEqual(treemap["root"]["size"], allocated)
+            self.assertEqual(snapshot["metadata"]["indexed_file_count"], 4)
+            self.assertEqual(tree["source"], "spotlight")
+            self.assertFalse(tree["complete"])
+            self.assertTrue(tree["partial"])
+            self.assertFalse(tree["requires_scan"])
+            with self.assertRaises(ValueError): server.quick_tree_for(self.base, self.root, 100)
+            new, hit = server.quick_snapshot(self.root)
+            self.assertEqual(query.call_count, 2)  # /quick alone applies TTL.
+            self.assertFalse(hit)
+            self.assertNotEqual(snapshot["metadata"]["id"], new["metadata"]["id"])
+            server.quick_snapshot(self.root, refresh=True)
+            self.assertEqual(query.call_count, 3)
+        self.assertEqual(server.STATE.snapshot(), old_state)
+        self.assertFalse(server.STATE.cancel_event.is_set())
+
+    def test_running_scan_publishes_only_completed_subtrees(self):
+        ready = self.root / "a"; ready.mkdir(); (ready / "ok.txt").write_bytes(b"x" * 5000)
+        busy = self.root / "b"; busy.mkdir(); (busy / "later.bin").write_bytes(b"y" * 5000)
+        real_scandir = os.scandir
+        blocked = threading.Event(); release = threading.Event()
+        class SortedEntries:
+            def __init__(self, path):
+                with real_scandir(path) as entries:
+                    self.entries = iter(sorted(entries, key=lambda entry: entry.name))
+            def __next__(self): return next(self.entries)
+            def __iter__(self): return self
+            def close(self): pass
+        def scan_entries(path):
+            if Path(path) == self.root:
+                return SortedEntries(path)
+            if Path(path) == busy:
+                blocked.set(); release.wait(3)
+            return real_scandir(path)
+        with mock.patch.object(server.os, "scandir", side_effect=scan_entries):
+            server.start_scan(str(self.root))
+            try:
+                self.assertTrue(blocked.wait(1))
+                status = server.STATE.snapshot()
+                self.assertTrue(status["running"])
+                self.assertEqual(status["current_directory"], str(busy))
+                self.assertEqual(status["dirs_completed"], 1)
+                for result in [server.tree_for(ready, 100), server.extension_stats(ready), server.treemap_for(ready)]:
+                    self.assertTrue(result["complete"])
+                    self.assertFalse(result["requires_scan"])
+                self.assertEqual(server.extension_stats(ready)["count"], 1)
+                self.assertTrue(server.scope_metadata(self.root)["requires_scan"])
+                self.assertTrue(server.scope_metadata(busy)["requires_scan"])
+            finally:
+                release.set(); self.wait_scan()
+        self.assertEqual(server.STATE.snapshot()["dirs_completed"], 3)
+        self.assertIsNone(server.STATE.snapshot()["current_directory"])
+
+    def test_completed_tree_reads_direct_children_and_treemap_limits_scope_depth(self):
+        child = self.root / "a"; child.mkdir()
+        deep = child / "deep"; deep.mkdir(); (deep / "file.bin").write_bytes(b"x" * 5000)
+        self.scan()
+        class DirectLookupOnly(dict):
+            def items(self): raise AssertionError("directory tree must not enumerate the whole snapshot")
+            def __iter__(self): raise AssertionError("directory tree must not copy the whole snapshot")
+        with mock.patch.object(server.STATE, "dir_sizes", DirectLookupOnly(server.STATE.dir_sizes)):
+            result = server.tree_for(self.root, 100)
+            self.assertEqual(result["files"], 1)
+            self.assertEqual(len(result["children"]), 1)
+            self.assertEqual(result["children"][0]["size"], result["size"])
+        original = server.render_treemap
+        server.STATE.dir_sizes["/unrelated/path"] = server.empty_aggregate()
+        with mock.patch.object(server, "render_treemap", wraps=original) as render:
+            server.treemap_for(self.root, depth=1)
+            self.assertEqual(set(render.call_args.args[1]), {str(self.root), str(child)})
+
+    def test_quick_empty_unavailable_cap_and_query_failure_are_partial(self):
+        for metadata in [
+            {"available": True, "query_complete": True, "error": None},
+            {"available": False, "query_complete": False, "error": "Spotlight unavailable"},
+            {"available": True, "query_complete": False, "timed_out": True, "error": None},
+        ]:
+            with self.subTest(metadata=metadata), mock.patch.object(server, "quick_spotlight_candidates", return_value=([], metadata)), mock.patch.object(server.os, "scandir", side_effect=AssertionError("no fallback scan")):
+                snapshot, _ = server.quick_snapshot(self.root, refresh=True)
+                result = server.quick_tree_for(self.root, self.root, 100)
+                self.assertEqual(result["children"], [])
+                self.assertEqual(result["available"], metadata["available"])
+                self.assertEqual(result["query_complete"], metadata["query_complete"])
+                self.assertFalse(result["complete"])
+                self.assertTrue(result["partial"])
+                self.assertEqual(result["error_count"], int(bool(metadata["error"])))
+                self.assertEqual(result["indexed_file_count"], 0)
+                self.assertEqual(server.quick_treemap_for(self.root, self.root)["root"]["children"], [])
+        files = []
+        for n in range(4):
+            path = self.root / f"{n}.bin"; path.write_bytes(b"fixture"); files.append(path)
+        with mock.patch.object(server, "QUICK_THRESHOLD", 1), mock.patch.object(server, "QUICK_MAX_CANDIDATES", 2), mock.patch.object(server, "quick_spotlight_candidates", return_value=(files, {"available": True, "query_complete": True, "error": None})):
+            snapshot = server.build_quick_snapshot(self.root)
+        self.assertEqual(snapshot["metadata"]["candidate_count"], 2)
+        self.assertEqual(snapshot["metadata"]["indexed_file_count"], 2)
+        self.assertTrue(snapshot["metadata"]["limit_reached"])
+        self.assertFalse(snapshot["metadata"]["query_complete"])
+
+    def test_quick_concurrent_panels_coalesce_one_query(self):
+        entered = threading.Event(); release = threading.Event()
+        results = []; errors = []
+        def query(root):
+            entered.set(); release.wait(2)
+            return [], {"available": True, "query_complete": True, "error": None}
+        def consume():
+            try: results.append(server.quick_scope(self.root, self.root)[1])
+            except Exception as exc: errors.append(exc)
+        with mock.patch.object(server, "quick_spotlight_candidates", side_effect=query) as call:
+            threads = [threading.Thread(target=consume) for _ in range(5)]
+            for thread in threads: thread.start()
+            self.assertTrue(entered.wait(1))
+            release.set()
+            for thread in threads: thread.join(2)
+            self.assertFalse(any(thread.is_alive() for thread in threads))
+            self.assertFalse(errors)
+            self.assertEqual(call.call_count, 1)
+            self.assertEqual(len(results), 5)
+            self.assertEqual(len({row["snapshot_id"] for row in results}), 1)
+
+    def test_quick_stream_timeout_and_limit_keep_only_complete_records(self):
+        real_popen = subprocess.Popen
+        paths = [self.root / f"{n}.bin" for n in range(5)]
+        payload = b"\0".join(os.fsencode(path) for path in paths) + b"\0"
+        def delayed_query(args, **kwargs):
+            self.assertEqual(args[-1], f"kMDItemFSSize >= {server.QUICK_THRESHOLD}")
+            script = f"import os,time; os.write(1,{payload!r}+b'/unfinished'); time.sleep(3)"
+            return real_popen([sys.executable, "-c", script], **kwargs)
+        with mock.patch.object(server, "sys_is_macos", return_value=True), mock.patch.object(server.subprocess, "Popen", side_effect=delayed_query), mock.patch.object(server, "QUICK_TIMEOUT", .2):
+            started = time.monotonic()
+            found, metadata = server.quick_spotlight_candidates(self.root)
+            self.assertLess(time.monotonic() - started, 1.5)
+            self.assertEqual(found, paths)
+            self.assertTrue(metadata["timed_out"])
+            self.assertFalse(metadata["query_complete"])
+            with mock.patch.object(server, "QUICK_MAX_CANDIDATES", 2):
+                found, metadata = server.quick_spotlight_candidates(self.root)
+                self.assertEqual(found, paths[:2])
+                self.assertTrue(metadata["limit_reached"])
+                self.assertFalse(metadata["query_complete"])
+
+    def test_quick_http_routes_share_snapshot_and_validate_scope(self):
+        httpd = server.LoopbackHTTPServer(("127.0.0.1", 0), server.Handler)
+        thread = threading.Thread(target=httpd.serve_forever, daemon=True); thread.start()
+        def request(endpoint, **query):
+            conn = http.client.HTTPConnection("127.0.0.1", httpd.server_address[1], timeout=2)
+            conn.request("GET", endpoint + "?" + urlencode(query))
+            response = conn.getresponse(); body = json.loads(response.read()); conn.close()
+            return response.status, body
+        try:
+            with mock.patch.object(server, "quick_spotlight_candidates", return_value=([], {"available": True, "query_complete": True, "error": None})) as query:
+                status, first = request("/api/quick", path=str(self.root))
+                self.assertEqual(status, 200)
+                for endpoint in ("tree", "extensions", "treemap", "largest"):
+                    with self.subTest(endpoint=endpoint):
+                        status, result = request("/api/" + endpoint, path=str(self.root), mode="quick", scope=str(self.root))
+                        self.assertEqual(status, 200)
+                        self.assertEqual(result["snapshot_id"], first["snapshot_id"])
+                self.assertEqual(request("/api/tree", path=str(self.root), mode="quick", root=str(self.root))[0], 200)
+                self.assertEqual(request("/api/tree", path=str(self.base), mode="quick", scope=str(self.root))[0], 400)
+                self.assertEqual(query.call_count, 1)
+                self.assertEqual(request("/api/quick", path=str(self.root), refresh=1)[0], 200)
+                self.assertEqual(query.call_count, 2)
+        finally:
+            httpd.shutdown(); httpd.server_close(); thread.join(2)
 
 
 if __name__ == "__main__":

@@ -17,6 +17,7 @@ import mimetypes
 import os
 import re
 import secrets
+import selectors
 import shutil
 import signal
 import socket
@@ -44,6 +45,10 @@ MAX_TREE_RESULTS = 5000
 MAX_SEARCH_RESULTS = 500
 TOP_FILES = 1000
 SPOTLIGHT_TTL = 300.0
+QUICK_THRESHOLD = 100_000_000
+QUICK_MAX_CANDIDATES = 10_000
+QUICK_TIMEOUT = 8.0
+QUICK_CACHE_LIMIT = 8
 CONFIRM_TTL = 300.0
 TOKEN = secrets.token_urlsafe(32)
 
@@ -257,6 +262,8 @@ class ScanState:
         self.path = None
         self.started_at = self.finished_at = None
         self.files_scanned = self.dirs_scanned = 0
+        self.dirs_completed = 0
+        self.current_directory = None
         self.logical_bytes = self.allocated_bytes = 0
         self.error_count = 0
         self.errors = []
@@ -274,6 +281,8 @@ class ScanState:
         self.path, self.scan_id = root, scan_id
         self.started_at, self.finished_at = time.time(), None
         self.files_scanned = self.dirs_scanned = self.logical_bytes = self.allocated_bytes = 0
+        self.dirs_completed = 0
+        self.current_directory = str(root)
         self.error_count = 0
         self.errors, self.excluded = [], []
         self.complete = self.cancelled = False
@@ -302,6 +311,7 @@ class ScanState:
             return {"running": self.running, "scan_id": self.scan_id,
                     "path": str(self.path) if self.path else None,
                     "files_scanned": self.files_scanned, "dirs_scanned": self.dirs_scanned,
+                    "dirs_completed": self.dirs_completed, "current_directory": self.current_directory,
                     "logical_bytes": self.logical_bytes, "allocated_bytes": self.allocated_bytes,
                     "bytes_scanned": self.allocated_bytes, "errors": list(self.errors),
                     "error_count": self.error_count, "complete": self.complete,
@@ -318,6 +328,8 @@ class ScanState:
 
 STATE = ScanState()
 SPOTLIGHT_CACHE = {}
+QUICK_CACHE = {}
+QUICK_INFLIGHT = {}
 APP_CACHE = None
 CONFIRMATIONS = {}
 CACHE_LOCK = threading.RLock()
@@ -351,7 +363,7 @@ def load_snapshot() -> None:
             STATE.scan_id = payload.get("scan_id")
             for key in ("started_at", "finished_at"):
                 setattr(STATE, key, dt.datetime.fromisoformat(payload[key]).timestamp())
-            for key in ("files_scanned", "dirs_scanned", "logical_bytes", "allocated_bytes", "error_count"):
+            for key in ("files_scanned", "dirs_scanned", "dirs_completed", "logical_bytes", "allocated_bytes", "error_count"):
                 setattr(STATE, key, int(payload.get(key, 0)))
             STATE.errors = payload.get("errors", [])[:100]
             STATE.excluded = payload.get("excluded_paths", [])[:100]
@@ -395,6 +407,7 @@ def scan_worker(root: Path, scan_id: str) -> None:
         with STATE.lock:
             STATE.dir_sizes[str(path)] = aggregate
             STATE.extensions_by_dir[str(path)] = {}
+            STATE.current_directory = str(path)
         try:
             iterator = os.scandir(path)
         except OSError as exc:
@@ -411,13 +424,19 @@ def scan_worker(root: Path, scan_id: str) -> None:
         path, iterator, aggregate = frames.pop()
         if iterator is not None:
             iterator.close()
-        aggregate["items"] = aggregate["files"] + aggregate["folders"]
-        aggregate["complete"] = finished and not aggregate["error_count"]
-        if frames:
-            parent = frames[-1][2]
-            for key in ("logical_bytes", "allocated_bytes", "files", "folders", "error_count"):
-                parent[key] += aggregate[key]
-            parent["folders"] += 1
+        with STATE.lock:
+            aggregate["items"] = aggregate["files"] + aggregate["folders"]
+            # Publishing complete under the same lock as readers makes this
+            # immutable subtree available while other directories keep scanning.
+            aggregate["complete"] = finished and not aggregate["error_count"]
+            if finished:
+                STATE.dirs_completed += 1
+            STATE.current_directory = str(frames[-1][0]) if frames else None
+            if frames:
+                parent = frames[-1][2]
+                for key in ("logical_bytes", "allocated_bytes", "files", "folders", "error_count"):
+                    parent[key] += aggregate[key]
+                parent["folders"] += 1
 
     try:
         enter(root)
@@ -454,10 +473,11 @@ def scan_worker(root: Path, scan_id: str) -> None:
                     allocated = getattr(st, "st_blocks", 0) * 512
                     unique_allocated = allocated
                     if st.st_nlink > 1:
-                        if inode in STATE.hardlinks:
-                            unique_allocated = 0
-                        else:
-                            STATE.hardlinks[inode] = str(path)
+                        with STATE.lock:
+                            if inode in STATE.hardlinks:
+                                unique_allocated = 0
+                            else:
+                                STATE.hardlinks[inode] = str(path)
                     aggregate["files"] += 1
                     aggregate["logical_bytes"] += logical
                     aggregate["allocated_bytes"] += unique_allocated
@@ -569,9 +589,273 @@ def spotlight_largest(root: Path, limit: int) -> tuple[list[dict], dict]:
     return payload["files"], payload
 
 
+def quick_spotlight_candidates(root: Path) -> tuple[list[Path], dict]:
+    """Read a bounded NUL-delimited index query without walking the filesystem."""
+    metadata = {"available": False, "query_complete": False, "timed_out": False,
+                "limit_reached": False, "error": None}
+    if not sys_is_macos():
+        return [], metadata | {"error": "Spotlight is unavailable on this platform"}
+    try:
+        proc = subprocess.Popen(["/usr/bin/mdfind", "-onlyin", str(root), "-0",
+                                 f"kMDItemFSSize >= {QUICK_THRESHOLD}"],
+                                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    except OSError:
+        return [], metadata | {"error": "Spotlight could not be started"}
+    metadata["available"] = True
+    paths = []
+    pending = b""
+    deadline = time.monotonic() + QUICK_TIMEOUT
+    eof = False
+    try:
+        with selectors.DefaultSelector() as selector:
+            selector.register(proc.stdout, selectors.EVENT_READ)
+            while not eof and not metadata["limit_reached"]:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    metadata["timed_out"] = True
+                    break
+                if not selector.select(remaining):
+                    metadata["timed_out"] = True
+                    break
+                chunk = os.read(proc.stdout.fileno(), 65536)
+                if not chunk:
+                    eof = True
+                    break
+                records = (pending + chunk).split(b"\0")
+                pending = records.pop()
+                for raw in records:
+                    if not raw:
+                        continue
+                    paths.append(Path(os.fsdecode(raw)))
+                    if len(paths) >= QUICK_MAX_CANDIDATES:
+                        metadata["limit_reached"] = True
+                        break
+                if len(pending) > 1024 * 1024:
+                    metadata["error"] = "Spotlight returned an invalid path record"
+                    break
+        if eof:
+            try:
+                proc.wait(timeout=max(.001, deadline - time.monotonic()))
+            except subprocess.TimeoutExpired:
+                metadata["timed_out"] = True
+            if proc.returncode:
+                metadata["error"] = "Spotlight query failed"
+                metadata["available"] = False
+    except (OSError, ValueError):
+        metadata["error"] = "Spotlight output could not be read"
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+        proc.wait()
+        proc.stdout.close()
+    metadata["query_complete"] = bool(eof and not metadata["error"]
+                                       and not metadata["timed_out"]
+                                       and not metadata["limit_reached"])
+    return paths, metadata
+
+
+def build_quick_snapshot(root: Path) -> dict:
+    started = time.monotonic()
+    candidates, query = quick_spotlight_candidates(root)
+    sizes = {str(root): empty_aggregate()}
+    files = {}
+    directories = {root: True}
+    seen_inodes = set()
+    rejected = 0
+    stat_errors = 0
+
+    def valid_directory(directory: Path) -> bool:
+        # Cache each ancestor once; candidate files still get their own lstat.
+        if directory in directories:
+            return directories[directory]
+        pending = []
+        current = directory
+        while current not in directories:
+            if not is_within(current, root):
+                return False
+            pending.append(current)
+            current = current.parent
+        valid = directories[current]
+        for current in reversed(pending):
+            if valid:
+                info = stat_record(current)
+                valid = bool(info and stat.S_ISDIR(info["mode"]))
+            directories[current] = valid
+        return valid
+
+    bounded = candidates[:QUICK_MAX_CANDIDATES]
+    if len(candidates) > QUICK_MAX_CANDIDATES:
+        query = query | {"limit_reached": True, "query_complete": False}
+    for candidate in sorted(set(bounded), key=os.fspath):
+        if (not candidate.is_absolute() or ".." in candidate.parts
+                or not is_within(candidate, root) or not valid_directory(candidate.parent)):
+            rejected += 1
+            continue
+        info = stat_record(candidate)
+        if info is None:
+            stat_errors += 1
+            continue
+        if not stat.S_ISREG(info["mode"]) or info["logical_size"] < QUICK_THRESHOLD:
+            rejected += 1
+            continue
+        inode = (info["device"], info["inode"])
+        allocated = 0 if inode in seen_inodes else info["allocated_size"]
+        seen_inodes.add(inode)
+        ext = candidate.suffix.lower().lstrip(".") or "(no extension)"
+        row = {"path": str(candidate), "name": candidate.name, "kind": "file",
+               "size": allocated, "allocated_size": allocated,
+               "logical_size": info["logical_size"], "physical_allocated_size": info["allocated_size"],
+               "modified": info["modified"], "extension": ext, "files": 1, "folders": 0,
+               "items": 1, "can_reveal": True, "source": "spotlight", "complete": False,
+               "partial": True, "error_count": 0}
+        files[str(candidate)] = row
+        directory = candidate.parent
+        while True:
+            aggregate = sizes.setdefault(str(directory), empty_aggregate())
+            aggregate["files"] += 1
+            aggregate["logical_bytes"] += info["logical_size"]
+            aggregate["allocated_bytes"] += allocated
+            if directory == root:
+                break
+            directory = directory.parent
+    child_dirs = defaultdict(list)
+    child_files = defaultdict(list)
+    for name in sizes:
+        directory = Path(name)
+        if directory == root:
+            continue
+        child_dirs[str(directory.parent)].append(name)
+        parent = directory.parent
+        while True:
+            sizes[str(parent)]["folders"] += 1
+            if parent == root:
+                break
+            parent = parent.parent
+    for name, row in files.items():
+        child_files[str(Path(name).parent)].append(row)
+    for aggregate in sizes.values():
+        aggregate["items"] = aggregate["files"] + aggregate["folders"]
+    elapsed = time.monotonic() - started
+    snapshot_id = uuid.uuid4().hex
+    created = time.time()
+    metadata = query | {"id": snapshot_id, "snapshot_id": snapshot_id, "root": str(root),
+                "scope": str(root), "snapshot_root": str(root), "source": "spotlight",
+                "complete": False, "partial": True, "requires_scan": False,
+                "indexed_file_count": len(files), "candidate_count": len(bounded),
+                "rejected_count": rejected, "error_count": stat_errors + int(bool(query.get("error"))),
+                "threshold_bytes": QUICK_THRESHOLD, "min_size": QUICK_THRESHOLD,
+                "elapsed": elapsed, "elapsed_ms": round(elapsed * 1000, 2),
+                "snapshot_at": iso_time(created), "indexed_at": iso_time(created),
+                "empty": not files, "size": sizes[str(root)]["allocated_bytes"],
+                "allocated_size": sizes[str(root)]["allocated_bytes"],
+                "logical_size": sizes[str(root)]["logical_bytes"]}
+    return {"created_at": created, "metadata": metadata, "sizes": sizes, "files": files,
+            "child_dirs": dict(child_dirs), "child_files": dict(child_files)}
+
+
+def quick_snapshot(root: Path, *, refresh: bool = False, consume: bool = False) -> tuple[dict, bool]:
+    """Only /quick refreshes TTL. Panel reads share even an expired snapshot."""
+    key = str(root)
+    with CACHE_LOCK:
+        cached = QUICK_CACHE.get(key)
+        if cached and (consume or (not refresh and time.time() - cached["created_at"] < SPOTLIGHT_TTL)):
+            return cached, True
+        flight = QUICK_INFLIGHT.get(key)
+        owner = flight is None
+        if owner:
+            flight = {"event": threading.Event(), "snapshot": None, "error": None}
+            QUICK_INFLIGHT[key] = flight
+    if not owner:
+        flight["event"].wait()
+        if flight["error"]:
+            raise flight["error"]
+        return flight["snapshot"], True
+    try:
+        snapshot = build_quick_snapshot(root)
+        with CACHE_LOCK:
+            QUICK_CACHE[key] = snapshot
+            while len(QUICK_CACHE) > QUICK_CACHE_LIMIT:
+                oldest = min(QUICK_CACHE, key=lambda entry: QUICK_CACHE[entry]["created_at"])
+                del QUICK_CACHE[oldest]
+            flight["snapshot"] = snapshot
+        return snapshot, False
+    except Exception as exc:
+        flight["error"] = exc
+        raise
+    finally:
+        with CACHE_LOCK:
+            QUICK_INFLIGHT.pop(key, None)
+            flight["event"].set()
+
+
+def quick_metadata(snapshot: dict, cache_hit: bool, path: Path | None = None) -> dict:
+    return snapshot["metadata"] | {"cache_hit": cache_hit,
+            "age_seconds": max(0, time.time() - snapshot["created_at"]),
+            "ttl_seconds": SPOTLIGHT_TTL, "path": str(path or snapshot["metadata"]["scope"])}
+
+
+def quick_scope(path: Path, scope: Path) -> tuple[dict, dict]:
+    if not is_within(path, scope):
+        raise ValueError("selected path must be inside the quick snapshot scope")
+    snapshot, cache_hit = quick_snapshot(scope, consume=True)
+    return snapshot, quick_metadata(snapshot, cache_hit, path)
+
+
+def quick_tree_for(path: Path, scope: Path, limit: int) -> dict:
+    snapshot, metadata = quick_scope(path, scope)
+    if str(path) in snapshot["files"]:
+        return trash_fields(metadata | snapshot["files"][str(path)] | {
+            "children": [], "has_more": False, "child_count": 0})
+    aggregate = snapshot["sizes"].get(str(path), empty_aggregate())
+    children = [aggregate_row(Path(name), snapshot["sizes"][name], "spotlight")
+                for name in snapshot["child_dirs"].get(str(path), [])]
+    children.extend(snapshot["child_files"].get(str(path), []))
+    children.sort(key=lambda row: (-row["size"], -row["logical_size"], row["name"]))
+    selected = [trash_fields(row | {"percent_parent": row["size"] * 100 / aggregate["allocated_bytes"]
+                                  if aggregate["allocated_bytes"] else 0}) for row in children[:limit]]
+    return trash_fields(metadata | aggregate_row(path, aggregate, "spotlight") | {
+        "children": selected, "has_more": len(children) > limit, "child_count": len(children),
+        "error_count": metadata["error_count"]})
+
+
+def quick_extension_stats(path: Path, scope: Path) -> dict:
+    snapshot, metadata = quick_scope(path, scope)
+    counts = defaultdict(lambda: [0, 0, 0])
+    for row in snapshot["files"].values():
+        if is_within(Path(row["path"]), path):
+            values = counts[row["extension"]]
+            values[0] += 1; values[1] += row["logical_size"]; values[2] += row["size"]
+    total = sum(value[2] for value in counts.values())
+    values = [{"extension": ext, "count": count, "size": allocated, "allocated_size": allocated,
+               "logical_size": logical, "percent": allocated * 100 / total if total else 0}
+              for ext, (count, logical, allocated) in counts.items()]
+    values.sort(key=lambda row: (-row["size"], row["extension"]))
+    return metadata | {"extensions": values, "size": total, "allocated_size": total,
+                       "logical_size": sum(x[1] for x in counts.values()),
+                       "count": sum(x[0] for x in counts.values())}
+
+
+def quick_largest(path: Path, scope: Path, limit: int) -> dict:
+    snapshot, metadata = quick_scope(path, scope)
+    rows = [row for row in snapshot["files"].values() if is_within(Path(row["path"]), path)]
+    rows.sort(key=lambda row: (-row["size"], -row["logical_size"], row["path"]))
+    return metadata | {"files": [trash_fields(row) for row in rows[:limit]],
+                       "scanned_path": str(scope), "has_more": len(rows) > limit}
+
+
+def quick_treemap_for(path: Path, scope: Path, depth: int = 3, maxnodes: int = 800) -> dict:
+    snapshot, metadata = quick_scope(path, scope)
+    sizes = snapshot["sizes"]
+    if str(path) not in sizes:
+        sizes = sizes | {str(path): empty_aggregate()}
+    return render_treemap(path, sizes, snapshot["files"].values(), metadata, depth, maxnodes)
+
+
 def scope_metadata(path: Path) -> dict:
     with STATE.lock:
-        aggregate = STATE.dir_sizes.get(str(path)) if not STATE.running else None
+        aggregate = STATE.dir_sizes.get(str(path))
+        if STATE.running and aggregate and not aggregate.get("complete"):
+            aggregate = None
         covered = aggregate is not None
         complete = bool(covered and aggregate.get("complete"))
         return {"path": str(path), "source": STATE.source if covered else "filesystem-shallow",
@@ -582,15 +866,31 @@ def scope_metadata(path: Path) -> dict:
 
 
 def extension_stats(path: Path) -> dict:
-    metadata = scope_metadata(path)
     counts = defaultdict(lambda: [0, 0, 0])
-    if not metadata["requires_scan"]:
-        with STATE.lock:
-            for directory, extensions in STATE.extensions_by_dir.items():
-                if is_within(Path(directory), path):
-                    for ext, values in extensions.items():
-                        for index in range(3):
-                            counts[ext][index] += values[index]
+    name = str(path)
+    prefix = name.rstrip("/") + "/"
+    with STATE.lock:
+        metadata = scope_metadata(path)
+        if metadata["requires_scan"]:
+            groups = []
+        elif STATE.running:
+            # Completed directory counters are immutable. Only collect their
+            # references while holding the lock; aggregate them outside it.
+            groups = [extensions for directory, extensions in STATE.extensions_by_dir.items()
+                      if (directory == name or directory.startswith(prefix))
+                      and STATE.dir_sizes.get(directory, {}).get("complete")]
+        else:
+            # A new scan replaces this mapping, so the finished mapping remains
+            # safe to iterate outside the lock even if a scan starts meanwhile.
+            finished = STATE.extensions_by_dir
+            groups = None
+    if groups is None:
+        groups = (extensions for directory, extensions in finished.items()
+                  if directory == name or directory.startswith(prefix))
+    for extensions in groups:
+        for ext, values in extensions.items():
+            for index in range(3):
+                counts[ext][index] += values[index]
     total = sum(x[2] for x in counts.values())
     values = [{"extension": ext, "count": n, "size": allocated,
                "logical_size": logical, "allocated_size": allocated,
@@ -649,12 +949,19 @@ def tree_for(path: Path, limit: int) -> dict:
                 "size": st["allocated_size"], "logical_size": st["logical_size"],
                 "allocated_size": st["allocated_size"], "children": [], "has_more": False,
                 "files": 1, "folders": 0, "items": 1, "source": "filesystem", "complete": True})
-    metadata = scope_metadata(path)
     children = []
     with STATE.lock:
-        sizes = dict(STATE.dir_sizes) if not STATE.running else {}
-        counted_files = {x[2]["path"]: x[2] for x in STATE.top_heap} if not STATE.running else {}
-        hardlink_owners = dict(STATE.hardlinks) if not STATE.running else {}
+        metadata = scope_metadata(path)
+        sizes = STATE.dir_sizes
+        aggregate_source = STATE.source
+        was_running = STATE.running
+        aggregate = sizes.get(str(path))
+        if aggregate is not None and (not was_running or aggregate.get("complete")):
+            aggregate = dict(aggregate)
+        else:
+            aggregate = None
+        counted_files = {x[2]["path"]: x[2] for x in STATE.top_heap}
+        hardlink_owners = STATE.hardlinks
     try:
         with os.scandir(path) as entries:
             for entry in entries:
@@ -670,9 +977,15 @@ def tree_for(path: Path, limit: int) -> dict:
                     kind = "file"
                 else:
                     continue
-                aggregate = sizes.get(str(child)) if kind == "directory" else None
-                if aggregate is not None:
-                    row = aggregate_row(child, aggregate, metadata["source"])
+                with STATE.lock:
+                    child_aggregate = sizes.get(str(child)) if kind == "directory" else None
+                    if child_aggregate is not None and (not was_running or child_aggregate.get("complete")):
+                        child_aggregate = dict(child_aggregate)
+                    else:
+                        child_aggregate = None
+                    owner = hardlink_owners.get((info["device"], info["inode"]))
+                if child_aggregate is not None:
+                    row = aggregate_row(child, child_aggregate, aggregate_source)
                 elif kind == "directory":
                     row = {"path": str(child), "name": child.name, "kind": kind, "size": None,
                            "allocated_size": None, "logical_size": None, "files": None,
@@ -680,7 +993,6 @@ def tree_for(path: Path, limit: int) -> dict:
                            "error_count": 0, "can_reveal": True}
                 else:
                     allocated = counted_files.get(str(child), {}).get("size", info["allocated_size"])
-                    owner = hardlink_owners.get((info["device"], info["inode"]))
                     if owner is not None and owner != str(child):
                         allocated = 0
                     row = {"path": str(child), "name": child.name, "kind": kind,
@@ -693,7 +1005,6 @@ def tree_for(path: Path, limit: int) -> dict:
                 children.append(trash_fields(row))
     except OSError as exc:
         raise ValueError(f"cannot read directory: {getattr(exc, 'strerror', 'permission denied')}")
-    aggregate = sizes.get(str(path))
     if aggregate is not None:
         result = aggregate_row(path, aggregate, metadata["source"])
     else:
@@ -709,11 +1020,31 @@ def tree_for(path: Path, limit: int) -> dict:
 
 
 def treemap_for(path: Path, depth: int = 3, maxnodes: int = 800) -> dict:
-    depth = max(1, min(4, depth)); maxnodes = max(2, min(1500, maxnodes))
-    metadata = scope_metadata(path)
+    depth = max(1, min(4, depth))
+    name = str(path)
+    prefix = name.rstrip("/") + "/"
+    def visible_directory(key: str, value: dict, running: bool) -> bool:
+        return ((key == name or (key.startswith(prefix) and key[len(prefix):].count("/") < depth))
+                and (not running or value.get("complete")))
     with STATE.lock:
-        sizes = dict(STATE.dir_sizes) if not STATE.running else {}
-        top = [dict(x[2]) for x in STATE.top_heap] if not STATE.running else []
+        metadata = scope_metadata(path)
+        if metadata["requires_scan"]:
+            sizes, top = {}, []
+        else:
+            top = [dict(x[2]) for x in STATE.top_heap]
+            if STATE.running:
+                sizes = {key: value for key, value in STATE.dir_sizes.items()
+                         if visible_directory(key, value, True)}
+            else:
+                finished = STATE.dir_sizes
+                sizes = None
+    if sizes is None:
+        sizes = {key: value for key, value in finished.items() if visible_directory(key, value, False)}
+    return render_treemap(path, sizes, top, metadata, depth, maxnodes)
+
+
+def render_treemap(path: Path, sizes: dict, top, metadata: dict, depth: int, maxnodes: int) -> dict:
+    depth = max(1, min(4, depth)); maxnodes = max(2, min(1500, maxnodes))
     root_aggregate = sizes.get(str(path))
     if root_aggregate is None:
         return metadata | {"root": {"name": path.name or str(path), "path": str(path),
@@ -727,7 +1058,9 @@ def treemap_for(path: Path, depth: int = 3, maxnodes: int = 800) -> dict:
             directories[str(child.parent)].append(aggregate_row(child, aggregate, metadata["source"]))
     for item in top:
         if is_within(Path(item["path"]), path) and item["size"] > 0:
-            leaves[str(Path(item["path"]).parent)].append(item | {"can_reveal": True, "complete": True})
+            leaves[str(Path(item["path"]).parent)].append(item | {
+                "can_reveal": True, "complete": item.get("complete", True),
+                "partial": item.get("partial", False)})
     node_count = 0
     truncated = False
 
@@ -763,7 +1096,8 @@ def treemap_for(path: Path, depth: int = 3, maxnodes: int = 800) -> dict:
                 "kind": "summary", "size": remaining_size, "allocated_size": remaining_size,
                 "logical_size": max(0, remaining_logical), "children": [],
                 "percent_parent": remaining_size * 100 / row["size"] if row["size"] else 0,
-                "can_reveal": False, "complete": row.get("complete", False)})
+                "can_reveal": False, "complete": row.get("complete", False),
+                "partial": not row.get("complete", False), "source": metadata["source"]})
             truncated = True
         return row
 
@@ -947,14 +1281,27 @@ class Handler(BaseHTTPRequestHandler):
         except Exception: self.error(500, "request failed")
 
     def api_get(self, path: str, query: dict[str, list[str]]) -> None:
-        if path == "/api/health": self.send_json({"ok": True, "service": "disk-space-analyzer", "version": "0.2.1", "platform": os.uname().sysname, "home": str(HOME), "token": TOKEN, "index": {"available": sys_is_macos() and Path("/usr/bin/mdfind").exists(), "provider": "Spotlight" if sys_is_macos() else "filesystem"}, "trash": {"available": compile_native_trash() is not None, "fallback": "Reveal in Finder, then move to Trash manually"}, "defaults": {"scan_path": str(DEFAULT_SCAN_ROOT), "data_path": "/System/Volumes/Data" if Path("/System/Volumes/Data").is_dir() else None, "port": self.server.server_address[1]}})
+        quick_mode = query.get("mode", [""])[0] == "quick"
+        def selected_scope(selected: Path) -> Path:
+            return normalize_existing(query.get("scope", query.get("root", [str(selected)]))[0])
+        if path == "/api/health": self.send_json({"ok": True, "service": "disk-space-analyzer", "version": "0.3.0", "platform": os.uname().sysname, "home": str(HOME), "token": TOKEN, "index": {"available": sys_is_macos() and Path("/usr/bin/mdfind").exists(), "provider": "Spotlight" if sys_is_macos() else "filesystem"}, "trash": {"available": compile_native_trash() is not None, "fallback": "Reveal in Finder, then move to Trash manually"}, "defaults": {"scan_path": str(DEFAULT_SCAN_ROOT), "data_path": "/System/Volumes/Data" if Path("/System/Volumes/Data").is_dir() else None, "port": self.server.server_address[1]}})
         elif path == "/api/volumes": self.send_json({"volumes": mounted_volumes()})
         elif path in ("/api/scan/status", "/api/status"): self.send_json(STATE.snapshot())
         elif path == "/api/summary": self.send_json(STATE.snapshot() | {"volumes": mounted_volumes()})
+        elif path == "/api/quick":
+            root = normalize_existing(query.get("path", [str(DEFAULT_SCAN_ROOT)])[0])
+            snapshot, cache_hit = quick_snapshot(root, refresh=query.get("refresh", ["0"])[0] == "1")
+            self.send_json(quick_metadata(snapshot, cache_hit))
         elif path == "/api/tree":
-            raw = query.get("path", [str(STATE.path or DEFAULT_SCAN_ROOT)])[0]; limit = min(max(int(query.get("limit", ["200"])[0]), 1), MAX_TREE_RESULTS); self.send_json(tree_for(normalize_existing(raw, allow_file=True), limit))
+            raw = query.get("path", [str(STATE.path or DEFAULT_SCAN_ROOT)])[0]
+            selected = normalize_existing(raw, allow_file=True)
+            limit = min(max(int(query.get("limit", ["200"])[0]), 1), MAX_TREE_RESULTS)
+            self.send_json(quick_tree_for(selected, selected_scope(selected), limit) if quick_mode else tree_for(selected, limit))
         elif path == "/api/largest":
             root = normalize_existing(query.get("path", [str(HOME)])[0]); limit = min(max(int(query.get("limit", ["100"])[0]), 1), MAX_SEARCH_RESULTS)
+            if quick_mode:
+                self.send_json(quick_largest(root, selected_scope(root), limit))
+                return
             with STATE.lock: ready = bool(STATE.path and not STATE.running and STATE.has_coverage(root))
             if ready:
                 with STATE.lock:
@@ -964,9 +1311,12 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 vals, payload = spotlight_largest(root, limit); self.send_json(payload | {"files": vals})
         elif path == "/api/extensions":
-            self.send_json(extension_stats(normalize_existing(query.get("path", [str(HOME)])[0])))
+            selected = normalize_existing(query.get("path", [str(HOME)])[0])
+            self.send_json(quick_extension_stats(selected, selected_scope(selected)) if quick_mode else extension_stats(selected))
         elif path == "/api/treemap":
-            self.send_json(treemap_for(normalize_existing(query.get("path", [str(HOME)])[0]), int(query.get("depth", ["3"])[0]), int(query.get("maxnodes", ["800"])[0])))
+            selected = normalize_existing(query.get("path", [str(HOME)])[0])
+            depth = int(query.get("depth", ["3"])[0]); maxnodes = int(query.get("maxnodes", ["800"])[0])
+            self.send_json(quick_treemap_for(selected, selected_scope(selected), depth, maxnodes) if quick_mode else treemap_for(selected, depth, maxnodes))
         elif path == "/api/apps":
             apps = list_apps()
             self.send_json({"apps": apps, "source": "du+filesystem", "complete": not any(x["size_partial"] for x in apps)})
