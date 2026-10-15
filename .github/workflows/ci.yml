@@ -25,7 +25,15 @@ jobs:
       - name: Backend checks
         run: |
           python -m py_compile server.py launcher.py scripts/build_release.py
-          python -m unittest discover -s . -p 'test_*.py' -v
+          python - <<'PYTEST'
+          import subprocess, sys
+          result = subprocess.run([sys.executable, '-m', 'unittest', 'discover', '-s', '.', '-p', 'test_*.py', '-v'], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+          print(result.stdout)
+          if result.returncode:
+              detail = result.stdout[-16000:].replace('%', '%25').replace('\r', '%0D').replace('\n', '%0A')
+              print('::error title=Regression test failure::' + detail)
+          raise SystemExit(result.returncode)
+          PYTEST
       - name: JavaScript and shell checks
         run: |
           node --check app.js
